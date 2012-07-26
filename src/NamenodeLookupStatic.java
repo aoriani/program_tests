@@ -15,7 +15,7 @@ public class NamenodeLookupStatic implements NamenodeLookup {
 
 	@Override
 	public void setListener(NamenodeChangedListener listener) {
-		this.listener= listener;
+		this.listener = listener;
 
 	}
 
@@ -29,5 +29,4 @@ public class NamenodeLookupStatic implements NamenodeLookup {
 		// Do nothing
 
 	}
-
 }

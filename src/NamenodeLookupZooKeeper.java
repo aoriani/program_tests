@@ -73,12 +73,12 @@ public class NamenodeLookupZooKeeper implements Watcher, NamenodeLookup {
         try {
         	connectedSignal = new CountDownLatch(1);
             connect();
+            retrieveNamenodeAddress();
         } catch (IOException e) {
             LOG.fatal("Problem when connecting to Zookeeper",e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-        }
-        retrieveNamenodeAddress();
+        }       
     }
 
 
