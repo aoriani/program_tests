@@ -19,7 +19,7 @@ public class FailoverTest implements NamenodeChangedListener {
 
     // Waiting time configs
     private static final int FAILOVER_INPROGRESS_WAIT_MIN = 5;
-    private static final int REGULAR_ERROR_WAIT_MS = 5000;
+    private static final int REGULAR_ERROR_WAIT_MS = 2000;
     private static final int FAILOVER_COMPLETED_WAIT_MS = 2000;
 
     private static final int BUFFER_SIZE = 4096;
@@ -31,7 +31,7 @@ public class FailoverTest implements NamenodeChangedListener {
     private String hostname;
     private volatile String namenodeAddress;
     private volatile CountDownLatch waitFailoverLatch;
-    private volatile boolean namenodeChanged;
+    private volatile boolean isFailoverComplete;
 
     public FailoverTest(NamenodeLookup namenode, int blocks, int files)
             throws UnknownHostException {
@@ -42,16 +42,16 @@ public class FailoverTest implements NamenodeChangedListener {
         this.namenodeAddress = namenode.getNamenodeAddress();
         this.hostname = InetAddress.getLocalHost().getHostName();
         this.waitFailoverLatch = new CountDownLatch(1);
-        this.namenodeChanged = false;
+        this.isFailoverComplete = false;
 
     }
 
     @Override
     public void namenodeChanged(String newAddress) {
         synchronized (this) {
-            LOG.info("EVENT: NAMENODE_CHANGED");
+            LOG.info("EVENT: NAMENODE_CHANGED " + newAddress);
             namenodeAddress = newAddress;
-            namenodeChanged = true;
+            isFailoverComplete = true;
             // Signalize that we should no longer wait for failover
             waitFailoverLatch.countDown();
         }
@@ -81,7 +81,8 @@ public class FailoverTest implements NamenodeChangedListener {
     private void create(String filename) throws InterruptedException,
     IOException {
         for (int i = 1; i <= MAX_ATTEMPTS; i++) {
-            LOG.info("EVENT: ATTEMPT_WRITE " + Integer.toString(i));
+            LOG.info("EVENT: ATTEMPT_WRITE " + Integer.toString(i) + " to "
+                    + filename);
             try {
                 attemptCreate(filename);
                 return;
@@ -106,15 +107,19 @@ public class FailoverTest implements NamenodeChangedListener {
 
     }
 
-    private void attemptCreate(String filename) throws IOException {
+    private void attemptCreate(final String filename) throws IOException {
         InputStream in = null;
         FileSystem hdfs = null;
         OutputStream out = null;
 
+        LOG.info("BEGIN attemptCreate" + filename);
+
         try {
-            LOG.info("EVENT: WRITE_STARTED " + filename);
+            String currentNamenodeAddress = getNamenodeAddress();
+            LOG.info("EVENT: WRITE_STARTED " + filename + " on "
+                    + currentNamenodeAddress);
             in = new BufferedInputStream(new DeadBeefInputStream(blocks));
-            String hdfsFileUri = "hdfs://" + getNamenodeAddress() + "/"
+            String hdfsFileUri = "hdfs://" + currentNamenodeAddress + "/"
                     + filename;
             Configuration conf = new Configuration();
             hdfs = FileSystem.get(URI.create(hdfsFileUri), conf);
@@ -123,30 +128,45 @@ public class FailoverTest implements NamenodeChangedListener {
             LOG.info("EVENT: WRITE_COMPLETE " + filename);
 
         } finally {
+            LOG.info("BEGIN FINALLY" + filename);
+            if (out != null) {
+                LOG.info("Closing FILE " + filename);
+                try {
+                    out.close();
+                } catch (Exception e) {
+                    LOG.error("Error closing file " + filename);
+                }
+            }
 
             if (hdfs != null) {
-                hdfs.close();
+                LOG.info("Closing HDFS");
+                try {
+                    hdfs.close();
+                } catch (Exception e) {
+                    LOG.error("Error closing HDFS for file " + filename);
+                }
             }
-
-            if (out != null) {
-                out.close();
-            }
+            LOG.info("END FINALLY" + filename);
         }
+
+        LOG.info("END attemptCreate" + filename);
     }
 
     private void doWrite(InputStream in, OutputStream out) throws IOException {
         int countBytes = 0;
         int data;
+        boolean failoverStateBefore = isFailoverComplete;
 
         while ((data = in.read()) != -1) {
             out.write(data);
             if ((++countBytes) == BUFFER_SIZE) {
                 countBytes = 0;
                 out.flush();
-                LOG.info("EVENT: WROTE_4K");
             }
 
-            if (namenodeChanged) throw new NameNodeChangedException();
+            boolean currentFailoverState = isFailoverComplete;
+            if (failoverStateBefore != currentFailoverState)
+                throw new NameNodeChangedException();
         }
     }
 
@@ -168,7 +188,7 @@ public class FailoverTest implements NamenodeChangedListener {
 
     private void handleGenericIOException() {
 
-        if (!namenodeChanged) {
+        if (!isFailoverComplete) {
             /*
              * Right now, we don't know what happened. We may be in the middle
              * of a failover or of some hiccup of namenode. Let's expect for the
@@ -182,7 +202,7 @@ public class FailoverTest implements NamenodeChangedListener {
                 // or for failover complete
                 waitFailoverLatch.await(FAILOVER_INPROGRESS_WAIT_MIN,
                         TimeUnit.MINUTES);
-                if (namenodeChanged) {
+                if (isFailoverComplete) {
                     // We do wait until it is complete
                     LOG.info("EVENT: FAILOVER_COMPLETE");
                 } else {
@@ -196,7 +216,8 @@ public class FailoverTest implements NamenodeChangedListener {
             }
         } else {
             // Okay this might be a standby hiccup, so wait 5 sec and try again
-            LOG.warn("Hot standby is facing some hiccup");
+            LOG.warn("We know that NN already changed, some I/0 error "
+                    + "or the RPC has not given up yet");
             try {
                 Thread.sleep(REGULAR_ERROR_WAIT_MS);
             } catch (InterruptedException e) {
@@ -215,18 +236,12 @@ public class FailoverTest implements NamenodeChangedListener {
     public static void main(String[] args) throws InterruptedException,
     IOException {
 
-        if ((args.length == 6) || (args.length == 5)) {
-            int nnLookupType = NamenodeLookup.STATIC;
-            if (args[0].equalsIgnoreCase("ha")) {
-                nnLookupType = NamenodeLookup.HA;
-            }
-            String primaryNamenode = args[1];
-            String zookeeper = args[2];
-            int files = Integer.parseInt(args[3]);
-            int blocks = Integer.parseInt(args[4]);
+        if ((args.length == 3)) {
+            String zookeeper = args[0];
+            int files = Integer.parseInt(args[1]);
+            int blocks = Integer.parseInt(args[2]);
 
-            NamenodeLookup nnlkp = NamenodeLookupFactory.create(nnLookupType,
-                    primaryNamenode, zookeeper);
+            NamenodeLookup nnlkp = new NamenodeLookupZooKeeper(zookeeper);
             FailoverTest cli = new FailoverTest(nnlkp, blocks, files);
             cli.run();
         } else {
