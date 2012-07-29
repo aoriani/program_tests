@@ -111,6 +111,7 @@ public class FailoverTest implements NamenodeChangedListener {
         InputStream in = null;
         FileSystem hdfs = null;
         OutputStream out = null;
+        boolean failoverStateBefore = isFailoverComplete;
 
         LOG.info("BEGIN attemptCreate" + filename);
 
@@ -128,25 +129,64 @@ public class FailoverTest implements NamenodeChangedListener {
             LOG.info("EVENT: WRITE_COMPLETE " + filename);
 
         } finally {
-            LOG.info("BEGIN FINALLY" + filename);
-            if (out != null) {
-                LOG.info("Closing FILE " + filename);
-                try {
-                    out.close();
-                } catch (Exception e) {
-                    LOG.error("Error closing file " + filename);
+            LOG.info("BEGIN FINALLY " + filename);
+
+            /*
+             * We're cheating here.
+             * 
+             * If no problem has happened, there should be no problem to close
+             * the file and filesystem and those steps will be executed quickly.
+             * 
+             * But if namenode crashes while writing the file, the main thread
+             * might be stuck 20 secs at the close methods, as Hadoop RPC will
+             * retry connecting to the crashed 10 times before giving up. This
+             * delay failover with something we know that won't succeed. So to
+             * avoid blocking main thread with those fuitless closes, we do them
+             * in a background. We do not avoid the close as we still need to
+             * free resources on the client side
+             */
+
+            final FileSystem hdfs_final = hdfs;
+            final OutputStream out_final = out;
+
+            Runnable cleanupRunnable = new Runnable() {
+
+                @Override
+                public void run() {
+                    // TODO Auto-generated method stub
+                    if (out_final != null) {
+                        LOG.info("Closing FILE " + filename);
+                        try {
+                            out_final.close();
+                        } catch (Exception e) {
+                            LOG.error("Error closing file " + filename);
+                        }
+                    }
+
+                    if (hdfs_final != null) {
+                        LOG.info("Closing HDFS");
+                        try {
+                            hdfs_final.close();
+                        } catch (Exception e) {
+                            LOG.error("Error closing HDFS for file " + filename);
+                        }
+                    }
                 }
+            };
+            boolean currentFailoverState = isFailoverComplete;
+
+            if (failoverStateBefore == currentFailoverState) {
+                // No failures, run on main thread
+                LOG.info("Cleanup on main thread");
+                cleanupRunnable.run();
+            } else {
+                // Namenode failed, RPC will stuck with failed namenode
+                // do clenup on background
+                LOG.info("Cleanup on background thread");
+                new Thread(cleanupRunnable, "Cleanup-" + filename).start();
             }
 
-            if (hdfs != null) {
-                LOG.info("Closing HDFS");
-                try {
-                    hdfs.close();
-                } catch (Exception e) {
-                    LOG.error("Error closing HDFS for file " + filename);
-                }
-            }
-            LOG.info("END FINALLY" + filename);
+            LOG.info("END FINALLY " + filename);
         }
 
         LOG.info("END attemptCreate" + filename);
